@@ -82,26 +82,30 @@ export default function StreamPage() {
         };
     };
 
-    const request = <T,>(event: string, data: RequestData): Promise<T> => {
-        return new Promise((resolve, reject) => {
-            const requestId = `${event}_${Date.now()}`;
-            const timeout = setTimeout(() => {
-                requestQueue.current.delete(requestId);
-                reject(new Error(`Request timed out for event: ${event}`));
-            }, 5000);
+    // src/app/stream/page.tsx
 
-            requestQueue.current.set(requestId, (responseData) => {
-                clearTimeout(timeout);
-                resolve(responseData as T);
-            });
+const request = <T,>(event: string, data: RequestData): Promise<T> => {
+    return new Promise((resolve, reject) => {
+        // FIX: Add Math.random() to ensure the ID is always unique
+        const requestId = `${event}_${Date.now()}_${Math.random()}`;
 
-            if (socketRef.current?.readyState === WebSocket.OPEN) {
-                socketRef.current.send(JSON.stringify({ event, data, requestId }));
-            } else {
-                reject(new Error("WebSocket is not connected."));
-            }
+        const timeout = setTimeout(() => {
+            requestQueue.current.delete(requestId);
+            reject(new Error(`Request timed out for event: ${event}`));
+        }, 5000);
+
+        requestQueue.current.set(requestId, (responseData) => {
+            clearTimeout(timeout);
+            resolve(responseData as T);
         });
-    };
+
+        if (socketRef.current?.readyState === WebSocket.OPEN) {
+            socketRef.current.send(JSON.stringify({ event, data, requestId }));
+        } else {
+            reject(new Error("WebSocket is not connected."));
+        }
+    });
+};
 
     //mediasoup logic
     const startStreaming = async () => {

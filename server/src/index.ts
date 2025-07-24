@@ -42,6 +42,11 @@ async function run() {
             consumers: new Map()
         });
 
+        // Send existing producers to the newly connected peer
+        producers.forEach(producer => {
+            socket.send(JSON.stringify({ event: 'new-producer', data: { producerId: producer.id } }));
+        });
+
         socket.on('message', async (message) => {
             try {
                 const { event, data, requestId } = JSON.parse(message.toString());
@@ -58,7 +63,7 @@ async function run() {
                 switch (event) {
                     case 'getRouterRtpCapabilities': {
                         const capabilities = router.rtpCapabilities;
-                        send('routerRtpCapabilities', capabilities);
+                        send('routerRtpCapabilities', router.rtpCapabilities);
                         break;
                     }
                     case 'createWebRtcTransport': {
@@ -67,7 +72,7 @@ async function run() {
                             webRtcServer: webRtcServer
                         });
                         peerState?.transports.set(transport.id, transport);
-                        send('webRtcTransportCreated', {
+                        send('createWebRtcTransport', {
                             id: transport.id,
                             iceParameters: transport.iceParameters,
                             iceCandidates: transport.iceCandidates,
@@ -82,7 +87,7 @@ async function run() {
                             throw new Error(`Transport with id "${transportId}" not found`);
                         }
                         await transport.connect({ dtlsParameters });
-                        send('transportConnected', { transportId });
+                        send('connectWebRtcTransport', { transportId });
                         break;
                     }
                     case 'produce': {
@@ -96,18 +101,10 @@ async function run() {
                         producers.set(producer.id, producer);
 
                         wss.clients.forEach(client => {
-                            if (client !== socket) {
-                                client.send(JSON.stringify({ event: 'new-producer', data: { producerId: producer.id } }));
-                            }
+                            client.send(JSON.stringify({ event: 'new-producer', data: { producerId: producer.id } }));
                         });
 
-                        producers.forEach(p => {
-                            if (p.id !== producer.id) {
-                                socket.send(JSON.stringify({ event: 'new-producer', data: { producerId: p.id } }));
-                            }
-                        });
-
-                        send('produced', { id: producer.id });
+                        send('produce', { id: producer.id });
                         break;
                     }
                     case 'consume': {
@@ -142,7 +139,7 @@ async function run() {
                             socket.send(JSON.stringify({ event: "consumer-closed", data: { consumerId: consumer.id } }));
                         });
 
-                        send('consumed', {
+                        send('consume', {
                             id: consumer.id,
                             producerId: consumer.producerId,
                             kind: consumer.kind,
@@ -155,7 +152,7 @@ async function run() {
                         const consumer = peerState?.consumers.get(consumerId);
                         if (!consumer) throw new Error(`Consumer with id "${consumerId}" not found`);
                         await consumer.resume();
-                        send('consumer-resumed', { consumerId });
+                        send('resume-consumer', { consumerId });
                         break;
                     }
                 }
