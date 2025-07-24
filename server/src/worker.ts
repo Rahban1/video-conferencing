@@ -32,14 +32,14 @@ export const startMediaSoup = async () => {
         listenInfos: [
             {
                 protocol: 'udp',
-                ip: '127.0.0.1',
-                announcedAddress: '127.0.0.1',
+                ip: '0.0.0.0',
+                announcedAddress: '192.168.1.22',
                 port: 44444
             },
             {
                 protocol: 'tcp',
-                ip: '127.0.0.1',
-                announcedAddress: '127.0.0.1',
+                ip: '0.0.0.0',
+                announcedAddress: '192.168.1.22',
                 port: 44444
             }
         ]

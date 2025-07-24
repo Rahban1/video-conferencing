@@ -129,12 +129,27 @@ async function run() {
                         if (!transport) {
                             throw new Error(`Transport with id "${transportId}" not found`);
                         }
+                        
                         const producer = await transport.produce({ kind, rtpParameters, appData });
                         peerState?.producers.set(producer.id, producer);
                         producers.set(producer.id, producer);
-
+                    
+                        // **ADD PRODUCER VALIDATION**
+                        console.log(`[ws] Producer created - ID: ${producer.id}, Kind: ${producer.kind}, Paused: ${producer.paused}`);
+                        
+                        // **ADD PRODUCER EVENT HANDLERS**
+                        producer.on('transportclose', () => {
+                            console.log(`Producer transport closed: ${producer.id}`);
+                            producers.delete(producer.id);
+                            peerState?.producers.delete(producer.id);
+                        });
+                    
+                        producer.on('trace', (trace) => {
+                            console.log(`Producer trace [${producer.id}]:`, trace);
+                        });
+                    
                         console.log(`[ws] Producer ${producer.id} created for peer ${peerId}, broadcasting to ${wss.clients.size - 1} other clients`);
-
+                    
                         // Broadcast to OTHER clients only (exclude the sender)
                         let broadcastCount = 0;
                         wss.clients.forEach(client => {
@@ -142,7 +157,7 @@ async function run() {
                                 console.log(`[ws] Broadcasting new producer ${producer.id} to another client`);
                                 client.send(JSON.stringify({ 
                                     event: 'new-producer', 
-                                    data: { producerId: producer.id } 
+                                    data: { producerId: producer.id, kind: producer.kind } // **ADD KIND INFO**
                                 }));
                                 broadcastCount++;
                             }

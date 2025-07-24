@@ -328,25 +328,27 @@ export default function StreamPage() {
 
     const consumeNewProducer = async (producerId: string) => {
         const device = deviceRef.current;
-        if (!device || !recvTransportRef.current) {
+        const transport = recvTransportRef.current;
+        
+        if (!device || !transport) {
             console.log('Device or recv transport not ready for consuming');
             return;
         }
-
+    
         // Don't consume our own producers
         if (producersRef.current.has(producerId)) {
             console.log('Skipping consumption of own producer');
             return;
         }
-
+    
         try {
             console.log(`[mediasoup] Consuming producer: ${producerId}`);
             const data = await request('consume', {
-                transportId: recvTransportRef.current.id,
+                transportId: transport.id,
                 producerId,
                 rtpCapabilities: device.rtpCapabilities,
             });
-
+    
             if (data) {
                 await handleConsumed(data);
             }
@@ -359,7 +361,7 @@ export default function StreamPage() {
         const { id, producerId, kind, rtpParameters } = data;
         const transport = recvTransportRef.current;
         if (!transport) return;
-
+    
         try {
             console.log(`[mediasoup] Creating consumer for producer: ${producerId}`);
             const consumer = await transport.consume({
@@ -370,19 +372,63 @@ export default function StreamPage() {
             });
             
             consumersRef.current.set(consumer.id, consumer);
-
+    
+            // **ADD CONSUMER EVENT HANDLERS**
+            consumer.on('transportclose', () => {
+                console.log(`Consumer transport closed: ${consumer.id}`);
+                handleConsumerClosed(consumer.id);
+            });
+    
+            consumer.on('producerclose', () => {
+                console.log(`Consumer producer closed: ${consumer.id}`);
+                handleConsumerClosed(consumer.id);
+            });
+    
+            consumer.on('trackended', () => {
+                console.log(`Consumer track ended: ${consumer.id}`);
+            });
+    
             const { track } = consumer;
+            
+            // **ADD TRACK VALIDATION**
+            if (!track) {
+                console.error('No track received from consumer');
+                return;
+            }
+    
+            console.log(`Received ${kind} track:`, track.id, track.readyState);
+            
             const newStream = new MediaStream([track]);
-
+    
             setRemoteStreams(prev => {
                 if (prev.find(s => s.id === consumer.id)) return prev;
                 console.log(`[mediasoup] Adding remote stream: ${consumer.id}`);
                 return [...prev, { id: consumer.id, producerId, stream: newStream, kind }];
             });
-
-            // Resume the consumer
-            await request('resume-consumer', { consumerId: consumer.id });
-            console.log(`[mediasoup] Consumer resumed: ${consumer.id}`);
+    
+            // **IMPROVED RESUME WITH RETRY**
+            try {
+                await request('resume-consumer', { consumerId: consumer.id });
+                console.log(`[mediasoup] Consumer resumed: ${consumer.id}`);
+                
+                // **ADD TRACK STATE LOGGING**
+                setTimeout(() => {
+                    console.log(`Track state after resume - ID: ${track.id}, ReadyState: ${track.readyState}, Enabled: ${track.enabled}`);
+                }, 1000);
+                
+            } catch (resumeError) {
+                console.error('Error resuming consumer:', resumeError);
+                // Retry resume
+                setTimeout(async () => {
+                    try {
+                        await request('resume-consumer', { consumerId: consumer.id });
+                        console.log(`[mediasoup] Consumer resumed on retry: ${consumer.id}`);
+                    } catch (retryError) {
+                        console.error('Retry resume failed:', retryError);
+                    }
+                }, 2000);
+            }
+            
         } catch (error) {
             console.error('Error handling consumed data:', error);
         }
@@ -418,6 +464,41 @@ export default function StreamPage() {
         };
     }, [localStream]);
 
+    // **ADD THIS DEBUGGING FUNCTION TO YOUR COMPONENT**
+    const debugStreamState = () => {
+        console.log('=== STREAM DEBUG INFO ===');
+        console.log('Local stream:', localStream);
+        console.log('Local stream tracks:', localStream?.getTracks().map(t => ({
+            id: t.id,
+            kind: t.kind,
+            readyState: t.readyState,
+            enabled: t.enabled
+        })));
+        
+        console.log('Remote streams:', remoteStreams.length);
+        remoteStreams.forEach((stream, index) => {
+            console.log(`Remote stream ${index}:`, {
+                id: stream.id,
+                producerId: stream.producerId,
+                kind: stream.kind,
+                tracks: stream.stream.getTracks().map(t => ({
+                    id: t.id,
+                    kind: t.kind,
+                    readyState: t.readyState,
+                    enabled: t.enabled
+                }))
+            });
+        });
+        
+        console.log('Producers:', Array.from(producersRef.current.entries()));
+        console.log('Consumers:', Array.from(consumersRef.current.entries()));
+        console.log('Device:', deviceRef.current);
+        console.log('Send transport state:', sendTransportRef.current?.connectionState);
+        console.log('Recv transport state:', recvTransportRef.current?.connectionState);
+    };
+
+
+
     return (
         <div className="min-h-screen bg-gray-900 text-white p-4">
             <h1 className="text-3xl font-bold text-center mb-4">WebRTC Stream Page</h1>
@@ -437,7 +518,13 @@ export default function StreamPage() {
                     >
                         Stop Streaming and Leave
                     </button>
-                )}
+                )} 
+                {/* <button
+                    onClick={debugStreamState}
+                    className="bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-2 px-4 rounded-lg shadow-lg"
+                >
+                    Debug Stream State
+                </button> */}
             </div>
 
             <div className="text-center mb-4">
@@ -461,25 +548,47 @@ export default function StreamPage() {
                 <div className="bg-gray-800 p-2 rounded-lg">
                     <h2 className="text-xl mb-2">Remote Streams ({remoteStreams.length})</h2>
                     <div id="remote-videos" className="space-y-4">
-                        {remoteStreams.map(({ id, stream, kind }) => (
-                            <div key={id} className="relative">
-                                <video
-                                    autoPlay
-                                    playsInline
-                                    muted
-                                    className="w-full rounded-md bg-black"
-                                    ref={video => {
-                                        if (video && video.srcObject !== stream) {
-                                            console.log(`[mediasoup] Assigning remote stream ${id} to video element:`, stream);
-                                            video.srcObject = stream;
-                                        }
-                                    }}
-                                />
-                                <div className="absolute top-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 text-xs rounded">
-                                    {kind} - {id.substring(0, 8)}
-                                </div>
-                            </div>
-                        ))}
+                    {remoteStreams.map(({ id, stream, kind }) => (
+                    <div key={id} className="relative">
+                        <video
+                            autoPlay
+                            playsInline
+                            muted={false} // **CHANGE: Don't mute remote streams**
+                            controls // **ADD: Temporary controls for debugging**
+                            className="w-full rounded-md bg-black"
+                            onLoadedMetadata={(e) => {
+                                console.log(`Video metadata loaded for ${id}:`, {
+                                    videoWidth: e.currentTarget.videoWidth,
+                                    videoHeight: e.currentTarget.videoHeight,
+                                    duration: e.currentTarget.duration
+                                });
+                            }}
+                            onError={(e) => {
+                                console.error(`Video error for ${id}:`, e);
+                            }}
+                            onPlay={() => console.log(`Video playing: ${id}`)}
+                            onPause={() => console.log(`Video paused: ${id}`)}
+                            ref={video => {
+                                if (video && video.srcObject !== stream) {
+                                    console.log(`[mediasoup] Assigning remote stream ${id} to video element:`, stream);
+                                    console.log('Stream tracks:', stream.getTracks());
+                                    video.srcObject = stream;
+                                    
+                                    // **ADD PLAY PROMISE HANDLING**
+                                    const playPromise = video.play();
+                                    if (playPromise !== undefined) {
+                                        playPromise.catch(error => {
+                                            console.error(`Error playing video ${id}:`, error);
+                                        });
+                                    }
+                                }
+                            }}
+                        />
+                        <div className="absolute top-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 text-xs rounded">
+                            {kind} - {id.substring(0, 8)}
+                        </div>
+                    </div>
+                ))}
                         {remoteStreams.length === 0 && (
                             <p className="text-gray-400">Waiting for other participants...</p>
                         )}
