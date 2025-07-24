@@ -2,16 +2,26 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as mediasoupClient from 'mediasoup-client';
-import { Consumer, Producer, Transport } from "mediasoup-client/types";
-import { RtpCapabilities } from "mediasoup/types";
+import { Consumer, Producer, Transport, RtpCapabilities } from "mediasoup-client/types";
 
 const SERVER_URL = 'ws://localhost:3001';
 
 interface RemoteStream {
-    id : string;
+    id: string;
     producerId: string;
-    stream : MediaStream;
-    kind : 'audio' | 'video';
+    stream: MediaStream;
+    kind: 'audio' | 'video';
+}
+
+interface RequestData {
+    [key: string]: string | boolean | RtpCapabilities | undefined;
+}
+
+interface ConsumedData {
+    id: string;
+    producerId: string;
+    kind: 'audio' | 'video';
+    rtpParameters: mediasoupClient.types.RtpParameters;
 }
 
 export default function StreamPage() {
@@ -20,12 +30,13 @@ export default function StreamPage() {
     const [remoteStreams, setRemoteStreams] = useState<RemoteStream[]>([]);
 
     const socketRef = useRef<WebSocket | null>(null);
-    const deviseRef = useRef<mediasoupClient.Device | null>(null);
+    const deviceRef = useRef<mediasoupClient.Device | null>(null);
     const sendTransportRef = useRef<Transport | null>(null);
     const recvTransportRef = useRef<Transport | null>(null);
-    const producersRef = useRef<Map<string,Producer>>(new Map());
+    const producersRef = useRef<Map<string, Producer>>(new Map());
     const consumersRef = useRef<Map<string, Consumer>>(new Map());
     const localVideoRef = useRef<HTMLVideoElement>(null);
+    const requestQueue = useRef<Map<string, (data: unknown) => void>>(new Map());
 
     //websocket comms
     const connectSocket = () => {
@@ -39,35 +50,26 @@ export default function StreamPage() {
         };
 
         socket.onmessage = async (event) => {
-            const { event : messageEvent, data } = JSON.parse(event.data);
-            console.log(`[ws] Recieved message:`, messageEvent, data);
+            const { event: messageEvent, data, requestId } = JSON.parse(event.data);
+            console.log(`[ws] Received message:`, messageEvent, data);
+
+            if (requestId && requestQueue.current.has(requestId)) {
+                requestQueue.current.get(requestId)!(data);
+                requestQueue.current.delete(requestId);
+                return;
+            }
 
             switch (messageEvent) {
                 case 'routerRtpCapabilities':
-                  await handleRouterRtpCapabilities(data);
-                  break;
-                case 'webRtcTransportCreated':
-                  await handleTransportCreated(data);
-                  break;
-                case 'transportConnected':
-                  // This is a confirmation, no action needed on send transport
-                  // For recv transport, we might want to start consuming
-                  break;
-                case 'produced':
-                  // This is a confirmation that our producer was created on the server
-                  console.log(`[mediasoup] Our producer with id ${data.id} was created`);
-                  break;
+                    await handleRouterRtpCapabilities(data);
+                    break;
                 case 'new-producer':
-                  // A new peer has started sending media
-                  await consumeNewProducer(data.producerId);
-                  break;
-                case 'consumed':
-                  await handleConsumed(data);
-                  break;
+                    await consumeNewProducer(data.producerId);
+                    break;
                 case 'consumer-closed':
                     handleConsumerClosed(data.consumerId);
                     break;
-              }
+            }
         };
 
         socket.onclose = () => {
@@ -80,20 +82,34 @@ export default function StreamPage() {
         };
     };
 
-    const sendMessage = (event : string, data : any) => {
-        if (socketRef.current?.readyState == WebSocket.OPEN) {
-            socketRef.current.send(JSON.stringify({ event, data }));
-        }
+    const request = <T,>(event: string, data: RequestData): Promise<T> => {
+        return new Promise((resolve, reject) => {
+            const requestId = `${event}_${Date.now()}`;
+            const timeout = setTimeout(() => {
+                requestQueue.current.delete(requestId);
+                reject(new Error(`Request timed out for event: ${event}`));
+            }, 5000);
+
+            requestQueue.current.set(requestId, (responseData) => {
+                clearTimeout(timeout);
+                resolve(responseData as T);
+            });
+
+            if (socketRef.current?.readyState === WebSocket.OPEN) {
+                socketRef.current.send(JSON.stringify({ event, data, requestId }));
+            } else {
+                reject(new Error("WebSocket is not connected."));
+            }
+        });
     };
 
     //mediasoup logic
-    // get user media and initialize connection
     const startStreaming = async () => {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio : true });
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
             setLocalStream(stream);
             if (localVideoRef.current) {
-                localVideoRef.current.srcObject = stream
+                localVideoRef.current.srcObject = stream;
             }
             connectSocket();
         } catch (error) {
@@ -101,101 +117,109 @@ export default function StreamPage() {
         }
     };
 
-    //load router capabilities and create device
-    const handleRouterRtpCapabilities = async (routerRtpCapabilities : RtpCapabilities) => {
+    const handleRouterRtpCapabilities = async (routerRtpCapabilities: RtpCapabilities) => {
         const device = new mediasoupClient.Device();
         await device.load({ routerRtpCapabilities });
-        deviseRef.current = device;
+        deviceRef.current = device;
 
-        //once the device is loaded, create transports
-        sendMessage('createWebRtcTransport', { isSender : true });
-        sendMessage('createWebRtcTransport', { isSender : false });
-    };
+        // Create transports first
+        await createSendTransport();
+        await createRecvTransport();
 
-    const handleTransportCreated = async (params : any) => {
-        const device = deviseRef.current;
-        if (!device) return;
-
-        // Check if this is a send or receive transport based on our request logic
-        // A more robust way would be to pass an identifier in the request
-        if (!sendTransportRef.current) {
-            const transport  =device.createSendTransport(params);
-            transport.on('connect', async ({ dtlsParameters }, callback) => {
-                console.log(`[mediasoup] send transport connecting... `);
-                sendMessage('connectWebRtcTransport', { transportId : transport.id, dtlsParameters });
-                socketRef.current!.addEventListener('message', (event) => {
-                    const msg = JSON.parse(event.data);
-                    if (msg.event === 'transportConnected' && msg.data.transportId === transport.id) {
-                        console.log(`[mediasoup] Send transport connected`);
-                        callback();
-                    }
-                });  
-            });
-
-            transport.on('produce', async ({ kind, rtpParameters, appData }, callback) => {
-                console.log(`[mediasoup] Producing ${kind}...`);
-                sendMessage('produce', { transportId : transport.id, kind, rtpParameters, appData });
-                socketRef.current!.addEventListener('message', (event) => {
-                    const msg = JSON.parse(event.data);
-                    if (msg.event === 'produced' && msg.data.id) {
-                        console.log(`[mediasoup] Produced ${kind} successfully`);
-                        callback({ id : msg.data.id });
-                    }
-                });
-            });
-
-            sendTransportRef.current = transport;
-            //start producing media
-            producerMedia(transport);
-        } else {
-            const transport = device.createRecvTransport(params);
-            transport.on('connect', ({ dtlsParameters }, callback) => {
-                console.log(`[mediasoup] Recv transport connected...`);
-                sendMessage('connectWebRtcTransport', { transportId : transport.id, dtlsParameters });
-                socketRef.current!.addEventListener('message', (event) => {
-                    const msg = JSON.parse(event.data);
-                    if (msg.event === 'transportConnected' && msg.data.transportId === transport.id) {
-                        console.log(`[mediasoup] Recv transport connected!`);
-                        callback();
-                    }
-                });         
-            });
-            recvTransportRef.current = transport;
+        // Now that transports are ready, produce media
+        if (sendTransportRef.current) {
+            produceMedia(sendTransportRef.current);
         }
     };
 
-    //produce audio and video tracks
-    const producerMedia = async (transport : Transport) => {
+    const createSendTransport = async () => {
+        const params = await request('createWebRtcTransport', { isSender: true });
+        const transport = deviceRef.current!.createSendTransport(params);
+
+        transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+            try {
+                await request('connectWebRtcTransport', { transportId: transport.id, dtlsParameters });
+                callback();
+            } catch (error) {
+                errback(error as Error);
+            }
+        });
+
+        transport.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
+            try {
+                const { id } = await request('produce', { transportId: transport.id, kind, rtpParameters, appData });
+                callback({ id });
+            } catch (error) {
+                errback(error as Error);
+            }
+        });
+
+        sendTransportRef.current = transport;
+    };
+
+    const createRecvTransport = async () => {
+        const params = await request('createWebRtcTransport', { isSender: false });
+        const transport = deviceRef.current!.createRecvTransport(params);
+
+        transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+            try {
+                await request('connectWebRtcTransport', { transportId: transport.id, dtlsParameters });
+                callback();
+            } catch (error) {
+                errback(error as Error);
+            }
+        });
+
+        recvTransportRef.current = transport;
+    };
+
+    const produceMedia = async (transport: Transport) => {
         if (!localStream || !transport) return;
 
         const videoTrack = localStream.getVideoTracks()[0];
         if (videoTrack) {
-            const videoProducer = await transport.produce({ track : videoTrack });
-            producersRef.current.set(videoProducer.id, videoProducer);
+            try {
+                const videoProducer = await transport.produce({ track: videoTrack });
+                producersRef.current.set(videoProducer.id, videoProducer);
+            } catch (err) {
+                console.error('Failed to produce video:', err);
+            }
         }
 
         const audioTrack = localStream.getAudioTracks()[0];
         if (audioTrack) {
-            const audioProducer = await transport.produce({ track : audioTrack });
-            producersRef.current.set(audioProducer.id, audioProducer);
+            try {
+                const audioProducer = await transport.produce({ track: audioTrack });
+                producersRef.current.set(audioProducer.id, audioProducer);
+            } catch (err) {
+                console.error('Failed to produce audio:', err);
+            }
         }
     };
 
-    // a new producer is available, create a consumer for it
-    const consumeNewProducer = async (producerId : string) => {
-        const device = deviseRef.current;
-        if(!device || !recvTransportRef.current) return;
+    const consumeNewProducer = async (producerId: string) => {
+        const device = deviceRef.current;
+        if (!device || !recvTransportRef.current) {
+            console.log('Device or recv transport not ready for consuming');
+            return;
+        }
 
-        console.log(`[mediasoup] Subscribing to new producer : ${producerId}`);
-        sendMessage('consume', {
-            transportId : recvTransportRef.current.id,
-            producerId,
-            rtpCapabilities : device.rtpCapabilities,
-        });
+        try {
+            const data = await request('consume', {
+                transportId: recvTransportRef.current.id,
+                producerId,
+                rtpCapabilities: device.rtpCapabilities,
+            });
+
+            if (data) {
+                await handleConsumed(data);
+            }
+        } catch (err) {
+            console.error('Failed to consume new producer:', err);
+        }
     };
 
-    //server has created the consumer, now create it locally
-    const handleConsumed = async (data : any) => {
+    const handleConsumed = async (data: ConsumedData) => {
         const { id, producerId, kind, rtpParameters } = data;
         const transport = recvTransportRef.current;
         if (!transport) return;
@@ -204,43 +228,45 @@ export default function StreamPage() {
             id,
             producerId,
             kind,
-            rtpParameters
+            rtpParameters,
         });
         consumersRef.current.set(consumer.id, consumer);
 
         const { track } = consumer;
         const newStream = new MediaStream([track]);
 
-        setRemoteStreams(prev => [...prev, { id : consumer.id, producerId, stream : newStream, kind }]);
+        setRemoteStreams(prev => {
+            if (prev.find(s => s.id === consumer.id)) return prev;
+            return [...prev, { id: consumer.id, producerId, stream: newStream, kind }];
+        });
 
-        //resume the consumer on the server to start recieving media
-        sendMessage('resume-consumer', { consumerId : consumer.id });
+        request('resume-consumer', { consumerId: consumer.id });
     };
 
-    const handleConsumerClosed = (consumerId : string) => {
+    const handleConsumerClosed = (consumerId: string) => {
         console.log(`[mediasoup] Consumer ${consumerId} closed`);
-        const producerId = consumersRef.current.get(consumerId)?.producerId;
         consumersRef.current.delete(consumerId);
-        setRemoteStreams(prev => prev.filter(s => s.id !== consumerId)); 
+        setRemoteStreams(prev => prev.filter(s => s.id !== consumerId));
     };
 
     useEffect(() => {
-        if (isConnected && localStream && !deviseRef.current) {
-          // Once connected and with a stream, get router capabilities
-          sendMessage('getRouterRtpCapabilities', {});
+        if (isConnected && localStream && !deviceRef.current) {
+            if (socketRef.current?.readyState === WebSocket.OPEN) {
+                socketRef.current.send(JSON.stringify({ event: 'getRouterRtpCapabilities', data: {} }));
+            }
         }
-      }, [isConnected, localStream]);
-    
-      useEffect(() => {
-        return () => {
-          socketRef.current?.close();
-          localStream?.getTracks().forEach(track => track.stop());
-          sendTransportRef.current?.close();
-          recvTransportRef.current?.close();
-        };
-      }, [localStream]);
+    }, [isConnected, localStream]);
 
-      return (
+    useEffect(() => {
+        return () => {
+            socketRef.current?.close();
+            localStream?.getTracks().forEach(track => track.stop());
+            sendTransportRef.current?.close();
+            recvTransportRef.current?.close();
+        };
+    }, [localStream]);
+
+    return (
         <div className="min-h-screen bg-gray-900 text-white p-4">
             <h1 className="text-3xl font-bold text-center mb-4">WebRTC Stream Page</h1>
             <div className="flex justify-center mb-4">
@@ -269,12 +295,12 @@ export default function StreamPage() {
                     <h2 className="text-xl mb-2">Remote Streams</h2>
                     <div id="remote-videos" className="space-y-4">
                         {
-                            remoteStreams.map(({id, stream}) => (
-                                <video 
+                            remoteStreams.map(({ id, stream }) => (
+                                <video
                                     key={id}
                                     autoPlay
                                     className="w-full rounded-md bg-black"
-                                    ref = {video => {
+                                    ref={video => {
                                         if (video) video.srcObject = stream;
                                     }}
                                 ></video>

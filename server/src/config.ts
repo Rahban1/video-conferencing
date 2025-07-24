@@ -38,11 +38,6 @@ export const config = {
             ],
         },
         webRtcTransport : {
-            listenIps : [
-                {
-                    ip : '127.0.0.1' // will use public ip for prod
-                },
-            ],
             enableUdp : true,
             enableTcp : true,
             preferUdp : true

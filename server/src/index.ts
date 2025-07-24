@@ -2,15 +2,14 @@ import express from 'express';
 import cors from 'cors';
 import http from 'http';
 import { WebSocketServer } from 'ws';
-import { startMediaSoup, getRouter } from './worker';
+import { startMediaSoup, getRouter, getWebRtcServer } from './worker';
 import { config } from './config';
 import { Producer, Transport, Consumer } from 'mediasoup/types';
 
-// in-memory structure for now, for prod we'll use database
 interface PeerState {
-    transports : Map<string, Transport>;
-    producers : Map<string, Producer>;
-    consumers : Map<string, Consumer>;
+    transports: Map<string, Transport>;
+    producers: Map<string, Producer>;
+    consumers: Map<string, Consumer>;
 }
 
 const peers = new Map<string, PeerState>();
@@ -19,13 +18,14 @@ const producers = new Map<string, Producer>();
 async function run() {
     await startMediaSoup();
     const router = getRouter();
+    const webRtcServer = getWebRtcServer();
 
     const app = express();
     app.use(cors());
     app.use(express.json());
 
-    app.get('/health', (req,res)=> {
-        res.send({ status : 'ok'});
+    app.get('/health', (req, res) => {
+        res.send({ status: 'ok' });
     })
 
     const server = http.createServer(app);
@@ -35,91 +35,82 @@ async function run() {
     wss.on('connection', (socket, req) => {
         const peerId = req.headers['sec-websocket-protocol'] || String(Date.now());
         console.log(`[ws] Peer connected : ${peerId}`);
-        
+
         peers.set(peerId, {
-            transports : new Map(),
-            producers : new Map(),
-            consumers : new Map()
+            transports: new Map(),
+            producers: new Map(),
+            consumers: new Map()
         });
 
         socket.on('message', async (message) => {
             try {
-                const {event, data} = JSON.parse(message.toString());
-                console.log(`[ws] Recieved event : ${event} from ${peerId}`);
+                const { event, data, requestId } = JSON.parse(message.toString());
+                console.log(`[ws] Received event : ${event} from ${peerId}`);
                 const peerState = peers.get(peerId);
                 if (!peerState && event !== 'getRouterRtpCapabilities') {
                     throw new Error('Peer state not found');
                 }
 
-                switch(event) {
-                    //client requests router capabilities
-                    case 'getRouterRtpCapabilities' : {
+                const send = <T>(event: string, data: T) => {
+                    socket.send(JSON.stringify({ event, data, requestId }));
+                };
+
+                switch (event) {
+                    case 'getRouterRtpCapabilities': {
                         const capabilities = router.rtpCapabilities;
-                        socket.send(JSON.stringify({ event : 'routerRtpCapabilities', data : capabilities}));
+                        send('routerRtpCapabilities', capabilities);
                         break;
                     }
-                    //client requests to create a transport
-                    case 'createWebRtcTransport' : {
-                        const transport = await router.createWebRtcTransport(config.mediasoup.webRtcTransport)
-                        //store the transport server side
+                    case 'createWebRtcTransport': {
+                        const transport = await router.createWebRtcTransport({
+                            ...config.mediasoup.webRtcTransport,
+                            webRtcServer: webRtcServer
+                        });
                         peerState?.transports.set(transport.id, transport);
-                        socket.send(JSON.stringify({
-                            event : 'webRtcTransportCreated',
-                            data : {
-                                id : transport.id,
-                                iceParameters : transport.iceParameters,
-                                iceCandidates : transport.iceCandidates,
-                                dtlsParameters : transport.dtlsParameters
-                            },
-                        }));
+                        send('webRtcTransportCreated', {
+                            id: transport.id,
+                            iceParameters: transport.iceParameters,
+                            iceCandidates: transport.iceCandidates,
+                            dtlsParameters: transport.dtlsParameters
+                        });
                         break;
                     }
-                    //client provides its DTLS parameters to connect the transport 
-                    case 'connectWebRtcTransport' : {
+                    case 'connectWebRtcTransport': {
                         const { transportId, dtlsParameters } = data;
                         const transport = peerState?.transports.get(transportId);
                         if (!transport) {
                             throw new Error(`Transport with id "${transportId}" not found`);
                         }
                         await transport.connect({ dtlsParameters });
-                        console.log(`[ws] transport connected : ${transportId}`);
-                        socket.send(JSON.stringify({ event : 'transportConnected', data : { transportId } }));
+                        send('transportConnected', { transportId });
                         break;
                     }
-                    //client wants to start producing
-                    case 'produce' : {
+                    case 'produce': {
                         const { transportId, kind, rtpParameters, appData } = data;
                         const transport = peerState?.transports.get(transportId);
                         if (!transport) {
-                            throw new Error(`Transport with id "${transportId}" not found`)
+                            throw new Error(`Transport with id "${transportId}" not found`);
                         }
                         const producer = await transport.produce({ kind, rtpParameters, appData });
-
-                        //store the producer
                         peerState?.producers.set(producer.id, producer);
-                        producers.set(producer.id, producer); // add to global
-                        console.log(`[ws] producer created: ${producer.id} of kind ${kind}`);
+                        producers.set(producer.id, producer);
 
-                        //inform all other peers that a new producer is available
                         wss.clients.forEach(client => {
                             if (client !== socket) {
-                                client.send(JSON.stringify({ event : 'new-producer', data : { producerId : producer.id } }));
+                                client.send(JSON.stringify({ event: 'new-producer', data: { producerId: producer.id } }));
                             }
                         });
 
-                        // also inform the current client about existing producers
                         producers.forEach(p => {
                             if (p.id !== producer.id) {
-                                socket.send(JSON.stringify({ event : 'new-producer', data : { producerId: p.id } }));
+                                socket.send(JSON.stringify({ event: 'new-producer', data: { producerId: p.id } }));
                             }
-                        })
+                        });
 
-                        // inform the client that producer is created 
-                        socket.send(JSON.stringify({ event : 'produced', data : { id : producer.id } }));
+                        send('produced', { id: producer.id });
                         break;
                     }
-                    //client want to start consuming
-                    case 'consume' : {
+                    case 'consume': {
                         const { transportId, producerId, rtpCapabilities } = data;
                         const transport = peerState?.transports.get(transportId);
                         if (!transport) {
@@ -137,43 +128,40 @@ async function run() {
                         const consumer = await transport.consume({
                             producerId,
                             rtpCapabilities,
-                            paused : true, //start paused
+                            paused: true,
                         });
 
                         peerState?.consumers.set(consumer.id, consumer);
 
                         consumer.on('transportclose', () => {
                             console.log(`[ws] Consumer's transport closed : ${consumer.id}`);
-                            socket.send(JSON.stringify({ event : "consumer-closed", data : { producerId: consumer.producerId, consumerId : consumer.id }}));
+                            socket.send(JSON.stringify({ event: "consumer-closed", data: { consumerId: consumer.id } }));
                         });
                         consumer.on('producerclose', () => {
                             console.log(`[ws] Consumer's producer closed: ${consumer.id}`);
-                            socket.send(JSON.stringify({ event : "consumer-closed", data : { producerId: consumer.producerId, consumerId : consumer.id }}));
+                            socket.send(JSON.stringify({ event: "consumer-closed", data: { consumerId: consumer.id } }));
                         });
 
-                        socket.send(JSON.stringify({
-                            event : 'consumed',
-                            data : {
-                                id : consumer.id,
-                                producerId : consumer.producerId,
-                                kind : consumer.kind,
-                                rtpParameters : consumer.rtpParameters,
-                            },
-                        }));
+                        send('consumed', {
+                            id: consumer.id,
+                            producerId: consumer.producerId,
+                            kind: consumer.kind,
+                            rtpParameters: consumer.rtpParameters,
+                        });
                         break;
                     }
-                    case 'resume-consumer' : {
+                    case 'resume-consumer': {
                         const { consumerId } = data;
                         const consumer = peerState?.consumers.get(consumerId);
                         if (!consumer) throw new Error(`Consumer with id "${consumerId}" not found`);
                         await consumer.resume();
-                        socket.send(JSON.stringify({ event : 'consumer-resumed', data : { consumerId } }));
+                        send('consumer-resumed', { consumerId });
                         break;
                     }
                 }
-            } catch(err) {
+            } catch (err) {
                 console.error(`[ws] Error handling message from ${peerId}: `, err);
-                socket.send(JSON.stringify({event : 'error', data : (err as Error).message }));
+                socket.send(JSON.stringify({ event: 'error', data: (err as Error).message }));
             }
         });
 

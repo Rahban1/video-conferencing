@@ -3,6 +3,7 @@ import { config } from './config';
 
 let worker: mediasoup.types.Worker;
 let router: mediasoup.types.Router;
+let webRtcServer: mediasoup.types.WebRtcServer;
 
 export const startMediaSoup = async () => {
     console.log('[mediasoup] starting mediasoup worker');
@@ -26,7 +27,27 @@ export const startMediaSoup = async () => {
     });
 
     console.log(`[mediasoup] Router created`);
-    return { worker, router }; 
+
+    webRtcServer = await worker.createWebRtcServer({
+        listenInfos: [
+            {
+                protocol: 'udp',
+                ip: '127.0.0.1',
+                announcedAddress: '127.0.0.1',
+                port: 44444
+            },
+            {
+                protocol: 'tcp',
+                ip: '127.0.0.1',
+                announcedAddress: '127.0.0.1',
+                port: 44444
+            }
+        ]
+    });
+    console.log(`[mediasoup] WebRtcServer created`);
+
+
+    return { worker, router, webRtcServer }; 
 };
 
 export const getRouter = () => {
@@ -34,4 +55,11 @@ export const getRouter = () => {
         throw new Error('MediaSoup router not initialized');
     }
     return router;
+}
+
+export const getWebRtcServer = () => {
+    if(!webRtcServer) {
+        throw new Error('MediaSoup webRtcServer not initialized');
+    }
+    return webRtcServer;
 }
