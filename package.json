@@ -1,0 +1,40 @@
+{
+  "name": "webrtc-hls-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev:next": "next dev --turbopack",
+    "dev:server": "ts-node-dev --respawn --transpile-only --project server/tsconfig.server.json server/src/index.ts",
+    "dev" : "concurrently 'npm:dev:next' 'npm:dev:server'",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "hls.js": "^1.6.7",
+    "mediasoup": "^3.16.7",
+    "mediasoup-client": "^3.12.5",
+    "next": "15.4.3",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/postcss": "^4",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/ws": "^8.18.1",
+    "concurrently": "^9.2.0",
+    "eslint": "^9",
+    "eslint-config-next": "15.4.3",
+    "tailwindcss": "^4",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5"
+  }
+}
