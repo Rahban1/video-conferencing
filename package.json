@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev:next": "next dev --turbopack",
+    "dev:next": "next dev --turbopack --experimental-https --experimental-https-key ./localhost+1-key.pem --experimental-https-cert ./localhost+1.pem",
     "dev:server": "ts-node-dev --respawn --transpile-only --project server/tsconfig.server.json server/src/index.ts",
-    "dev" : "concurrently 'npm:dev:next' 'npm:dev:server'",
+    "dev": "concurrently 'npm:dev:next' 'npm:dev:server'",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
