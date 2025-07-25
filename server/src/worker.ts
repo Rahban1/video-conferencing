@@ -5,7 +5,7 @@ let worker: mediasoup.types.Worker;
 let router: mediasoup.types.Router;
 let webRtcServer: mediasoup.types.WebRtcServer;
 
-export const startMediaSoup = async () => {
+export const startMediasoup = async () => {
     console.log('[mediasoup] starting mediasoup worker');
 
     worker = await mediasoup.createWorker({

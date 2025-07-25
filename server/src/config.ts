@@ -38,9 +38,20 @@ export const config = {
             ],
         },
         webRtcTransport : {
+            listenIps: [
+                {
+                    ip : '127.0.0.1'
+                }
+            ],
             enableUdp : true,
             enableTcp : true,
             preferUdp : true
-        },       
+        },    
+        
+        plainTransport : {
+            listenIp : { ip : '127.0.0.1', announcedIp : '127.0.0.1' },
+            rtcpMux : true,
+            comedia : false
+        }
     },
 } as const;
