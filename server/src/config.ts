@@ -50,7 +50,7 @@ export const config = {
         
         plainTransport : {
             listenIp : { ip : '127.0.0.1', announcedIp : '127.0.0.1' },
-            rtcpMux : true,
+            rtcpMux : false,
             comedia : false
         }
     },

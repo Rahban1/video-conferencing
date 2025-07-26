@@ -1,0 +1,7 @@
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=FFMPEG_VIDEO
+c=IN IP4 127.0.0.1
+t=0 0
+m=video 10052 RTP/AVP 101
+a=rtpmap:101 VP8/90000

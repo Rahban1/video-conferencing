@@ -23,7 +23,7 @@ const producers = new Map<string, Producer>();
 // --- HLS/FFMPEG State ---
 let ffmpegProcess: ChildProcessWithoutNullStreams | null = null;
 let rtpTransport: PlainTransport | null = null;
-let audioTransport: PlainTransport | null = null; // Separate transport for audio
+let audioTransport: PlainTransport | null = null;
 const rtpConsumers = new Map<string, Consumer>();
 
 // --- Helper Function to Start FFMPEG ---
@@ -48,26 +48,35 @@ const startFfmpeg = async () => {
         fs.mkdirSync(hlsDir, { recursive: true });
     }
 
-    // Generate SDP file content dynamically
-    const sdpContent = `v=0
+    // Generate separate SDP files for video and audio
+    const videoSdpContent = `v=0
 o=- 0 0 IN IP4 127.0.0.1
-s=FFMPEG
+s=FFMPEG_VIDEO
 c=IN IP4 127.0.0.1
 t=0 0
 m=video ${rtpTransport.tuple.localPort} RTP/AVP 101
-a=rtpmap:101 VP8/90000
+a=rtpmap:101 VP8/90000`;
+
+    const audioSdpContent = `v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=FFMPEG_AUDIO
+c=IN IP4 127.0.0.1
+t=0 0
 m=audio ${audioTransport.tuple.localPort} RTP/AVP 102
 a=rtpmap:102 opus/48000/2`;
 
-    // Write the SDP to a file for FFMPEG to read
-    const sdpFilePath = path.join(hlsDir, 'stream.sdp');
-    fs.writeFileSync(sdpFilePath, sdpContent);
+    // Write separate SDP files
+    const videoSdpPath = path.join(hlsDir, 'video.sdp');
+    const audioSdpPath = path.join(hlsDir, 'audio.sdp');
+    fs.writeFileSync(videoSdpPath, videoSdpContent);
+    fs.writeFileSync(audioSdpPath, audioSdpContent);
 
     const ffmpegArgs = [
         '-protocol_whitelist', 'file,udp,rtp',
-        '-i', sdpFilePath,
+        '-i', videoSdpPath,
+        '-i', audioSdpPath,
         '-map', '0:v:0',
-        '-map', '1:a:0', // Map the second input (audio)
+        '-map', '1:a:0',
         '-c:v', 'libx264',
         '-c:a', 'aac',
         '-preset', 'veryfast',
@@ -96,8 +105,8 @@ a=rtpmap:102 opus/48000/2`;
 
         const rtpConsumer = await transport.consume({
             producerId: producer.id,
-            rtpCapabilities: router.rtpCapabilities, // Use router's capabilities for PlainTransport
-            paused: false, // Start unpaused
+            rtpCapabilities: router.rtpCapabilities,
+            paused: false,
         });
         rtpConsumers.set(producer.id, rtpConsumer);
         console.log(`[ffmpeg] Piped producer ${producer.id} (${producer.kind}) to FFMPEG`);
@@ -108,9 +117,8 @@ a=rtpmap:102 opus/48000/2`;
         await pipeProducerToRtp(producer);
     }
     
-    return pipeProducerToRtp; // Return the function to be used for new producers
+    return pipeProducerToRtp;
 };
-
 
 // --- Main Server Function ---
 async function run() {
@@ -133,8 +141,11 @@ async function run() {
     
     peers.set(peerId, { transports: new Map(), producers: new Map(), consumers: new Map() });
 
+    // Send existing producers to new peer
     if (producers.size > 0) {
-        producers.forEach(p => socket.send(JSON.stringify({ event: 'new-producer', data: { producerId: p.id } })));
+        producers.forEach(p => {
+            socket.send(JSON.stringify({ event: 'new-producer', data: { producerId: p.id } }));
+        });
     }
 
     socket.on('message', async (message) => {
@@ -178,6 +189,7 @@ async function run() {
             peerState.producers.set(producer.id, producer);
             producers.set(producer.id, producer);
 
+            // Start FFMPEG if this is the first producer
             if (!ffmpegProcess) {
                 pipeProducerToRtpFunc = await startFfmpeg();
             }
@@ -185,11 +197,13 @@ async function run() {
                 await pipeProducerToRtpFunc(producer);
             }
 
+            // Notify all other peers about the new producer
             wss.clients.forEach(client => {
-                if (client !== socket) {
+                if (client !== socket && client.readyState === client.OPEN) {
                     client.send(JSON.stringify({ event: 'new-producer', data: { producerId: producer.id } }));
                 }
             });
+            
             sendResponse('produced', { id: producer.id });
             break;
           }
@@ -203,9 +217,23 @@ async function run() {
 
             const consumer = await transport.consume({ producerId, rtpCapabilities, paused: true });
             peerState.consumers.set(consumer.id, consumer);
-            consumer.on('transportclose', () => socket.send(JSON.stringify({ event: 'consumer-closed', data: { consumerId: consumer.id }})));
-            consumer.on('producerclose', () => socket.send(JSON.stringify({ event: 'consumer-closed', data: { consumerId: consumer.id }})));
-            sendResponse('consumed', { id: consumer.id, producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters });
+            
+            consumer.on('transportclose', () => {
+                console.log(`[ws] Consumer transport closed: ${consumer.id}`);
+                socket.send(JSON.stringify({ event: 'consumer-closed', data: { consumerId: consumer.id }}));
+            });
+            
+            consumer.on('producerclose', () => {
+                console.log(`[ws] Consumer producer closed: ${consumer.id}`);
+                socket.send(JSON.stringify({ event: 'consumer-closed', data: { consumerId: consumer.id }}));
+            });
+            
+            sendResponse('consumed', { 
+              id: consumer.id, 
+              producerId, 
+              kind: consumer.kind, 
+              rtpParameters: consumer.rtpParameters 
+            });
             break;
           }
           case 'resume-consumer': {
@@ -213,12 +241,18 @@ async function run() {
               const consumer = peerState.consumers.get(consumerId);
               if (!consumer) throw new Error(`Consumer not found`);
               await consumer.resume();
+              console.log(`[ws] Consumer resumed: ${consumerId}`);
               sendResponse('consumer-resumed', { consumerId });
               break;
           }
         }
       } catch (err) {
         console.error(`[ws] Error handling message from ${peerId}:`, err);
+        socket.send(JSON.stringify({ 
+          id: JSON.parse(message.toString()).id, 
+          event: 'error', 
+          data: { message: (err as Error).message } 
+        }));
       }
     });
 
@@ -226,14 +260,32 @@ async function run() {
       console.log(`[ws] Peer disconnected: ${peerId}`);
       const peerState = peers.get(peerId);
       if (peerState) {
+          // Clean up producers
           peerState.producers.forEach(producer => {
               producers.delete(producer.id);
-              rtpConsumers.get(producer.id)?.close();
-              rtpConsumers.delete(producer.id);
+              const rtpConsumer = rtpConsumers.get(producer.id);
+              if (rtpConsumer) {
+                  rtpConsumer.close();
+                  rtpConsumers.delete(producer.id);
+              }
+              
+              // Notify other peers that this producer is gone
+              wss.clients.forEach(client => {
+                  if (client.readyState === client.OPEN) {
+                      client.send(JSON.stringify({ 
+                          event: 'producer-closed', 
+                          data: { producerId: producer.id } 
+                      }));
+                  }
+              });
           });
+          
+          // Close all transports
           peerState.transports.forEach(transport => transport.close());
           peers.delete(peerId);
       }
+      
+      // Stop FFMPEG if no producers left
       if (producers.size === 0 && ffmpegProcess) {
           console.log('[ffmpeg] All producers left, stopping FFMPEG');
           ffmpegProcess.kill('SIGINT');
